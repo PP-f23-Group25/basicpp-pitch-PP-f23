@@ -8,7 +8,7 @@ int main(int argc, char** argv) {
 
     // Initialize the model
     auto model = amtModel();
-
+    
     // Transcribe the audio
     auto notes = model.transcribeAudio(audio);
 

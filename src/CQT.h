@@ -2,7 +2,8 @@
 
 #include "typedef.h"
 #include <vector>
-
+#include <Eigen/Dense>
+using namespace Eigen;
 class CQParams {
     public:
         // init params  
@@ -35,7 +36,7 @@ class CQ {
 
         // compute cqt API for Eigen IO
         // Matrixf cqtEigen(const Vectorf& x);
-        Matrixf computeCQT(const Vectorf& x, bool batch_norm);
+        Matrixf computeCQT(const VectorXf& x, bool batch_norm);
 
         // Return the cqt feature with harmonic stacking, for vector of matrix IO
         VecMatrixf cqtHarmonic(const Vectorf& x, bool batch_norm);

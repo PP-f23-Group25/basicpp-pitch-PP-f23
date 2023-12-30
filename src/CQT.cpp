@@ -2,11 +2,15 @@
 #include "constant.h"
 #include "utils.h"
 #include "loader.h"
-
+#include <chrono>
+#include <Eigen/Dense>
+#include <immintrin.h> // Include Intel Intrinsics header
+#include <omp.h>
+#include <pthread.h>
 #include <iostream>
 #include <cassert>
 #include <cmath>
-
+using namespace Eigen;
 CQParams::CQParams( bool contour ) {
     sample_rate = SAMPLE_RATE;
     bins_per_octave = SEMITON_PER_OCTAVE * 
@@ -70,6 +74,7 @@ Matrixcf CQ::forward( const Vectorf &x, int hop_length ) {
 }
 
 // output shape = (n_harmonics, n_frames, n_bins)
+// Time ave cost/ frame: 188 microseconds 
 VecMatrixf CQ::harmonicStacking(const Matrixf& cqt , int bins_per_semitone, std::vector<float> harmonics, int n_output_freqs) {
     
     int n_bins = cqt.rows(), n_frames = cqt.cols();
@@ -97,9 +102,142 @@ VecMatrixf CQ::harmonicStacking(const Matrixf& cqt , int bins_per_semitone, std:
     return result;
 }
 
+// Non-simd version
+// Time cost / frame : 4503 microseconds
+// Matrixf CQ::computeCQT(const VectorXf& audio, bool batch_norm) {
+//     // NOTE : input audio should be 1D array at this point
+//     int hop = params.sample_per_frame;
+//     int n_fft_x = audio.size() / hop + 1;
+//     int _n_bins = _kernel.rows();
 
-// Matrixf CQ::cqtEigen(const Vectorf& audio) {
-Matrixf CQ::computeCQT(const Vectorf& audio, bool batch_norm) {
+//     Matrixcf cqt_feat(params.n_bins, n_fft_x );
+
+//     // Getting the top octave CQT
+//     int start = params.n_bins - _n_bins;
+//     cqt_feat.block(start , 0, _n_bins, n_fft_x) = forward(audio, hop);
+
+//     Vectorf audio_down = audio;
+
+//     for ( int i = 1 ; i < params.n_octaves ; i++ ) {
+//         start -= _n_bins;
+//         hop /= 2;
+//         audio_down = downsamplingByN(audio_down, _filter_kernel, 2.0f);
+//         if (start >= 0)
+//             cqt_feat.block(start, 0, _n_bins, n_fft_x) = forward(audio_down, hop);
+//         else
+//             cqt_feat.block(0, 0, _n_bins + start, n_fft_x) = forward(audio_down, hop).block(-start, 0, _n_bins + start, n_fft_x);
+//     }
+
+//     // normalization
+//     // top_cqt_feat *= params.downsample_factor; // we don't need this since the factor is 1
+//     // librosa fasion normalization
+//     cqt_feat = cqt_feat * _lengths.transpose().replicate(1, n_fft_x);
+
+//     // power of magnitude
+//     MatrixXf power = cqt_feat.array().cwiseAbs2() + 1e-10;
+//     MatrixXf log_power = 10.0f * power.array().log10().matrix();
+//     log_power = (log_power.array() - log_power.minCoeff()) / (log_power.maxCoeff() - log_power.minCoeff());
+
+//     // batch normalization
+//     if ( batch_norm) {
+//         constexpr float gamma = 0.48823851346969604;
+//         constexpr float beta = 0.3687160313129425;
+//         constexpr float mean = 0.5021218657493591;
+//         constexpr float var = 0.03773479163646698;
+
+//         log_power = (log_power.array() - mean) * gamma / sqrt(var + 0.001f) + beta;
+//     }
+
+//     return log_power;
+// }
+
+
+// Struct to hold data for each thread
+struct ThreadData {
+    int start;
+    int end;
+    int hop;
+    MatrixXcf& cqt_feat;
+    const Vectorf& audio_down;
+    const MatrixXcf& _filter_kernel;
+};
+
+// Function that each thread will execute
+void* computeCQTThread(void* threadDataPtr) {
+    ThreadData* data = static_cast<ThreadData*>(threadDataPtr);
+
+    for (int i = data->start; i < data->end; i++) {
+        int start = i - data->hop;
+        if (start >= 0)
+            data->cqt_feat.block(start, 0, data->hop, data->cqt_feat.cols()) = forward(data->audio_down, data->hop);
+        else
+            data->cqt_feat.block(0, 0, data->hop + start, data->cqt_feat.cols()) =
+                forward(data->audio_down, data->hop).block(-start, 0, data->hop + start, data->cqt_feat.cols());
+    }
+
+    pthread_exit(nullptr);
+}
+
+MatrixXf CQ::computeCQTWithPthreads(const Vectorf& audio, bool batch_norm) {
+    int hop = params.sample_per_frame;
+    int n_fft_x = audio.size() / hop + 1;
+    int _n_bins = _kernel.rows();
+
+    Matrixcf cqt_feat(params.n_bins, n_fft_x);
+
+    // Getting the top octave CQT
+    int start = params.n_bins - _n_bins;
+    cqt_feat.block(start, 0, _n_bins, n_fft_x) = forward(audio, hop);
+
+    Vectorf audio_down = audio;
+
+    const int num_threads = 4;  // Adjust the number of threads as needed
+    pthread_t threads[num_threads];
+    ThreadData threadData[num_threads];
+
+    for (int i = 0; i < params.n_octaves - 1; i += num_threads) {
+        for (int t = 0; t < num_threads; ++t) {
+            int octave_index = i + t;
+            if (octave_index < params.n_octaves - 1) {
+                threadData[t] = {start, start - _n_bins, hop, cqt_feat, audio_down, _filter_kernel};
+                start -= _n_bins;
+                hop /= 2;
+                audio_down = downsamplingByN(audio_down, _filter_kernel, 2.0f);
+                pthread_create(&threads[t], nullptr, computeCQTThread, &threadData[t]);
+            }
+        }
+
+        // Wait for threads to finish
+        for (int t = 0; t < num_threads && (i + t) < params.n_octaves - 1; ++t) {
+            pthread_join(threads[t], nullptr);
+        }
+    }
+
+    // normalization
+    cqt_feat = cqt_feat * _lengths.transpose().replicate(1, n_fft_x);
+
+    // power of magnitude
+    MatrixXf power = cqt_feat.array().cwiseAbs2() + 1e-10;
+    MatrixXf log_power = 10.0f * power.array().log10().matrix();
+    log_power = (log_power.array() - log_power.minCoeff()) / (log_power.maxCoeff() - log_power.minCoeff());
+
+    // batch normalization
+    if (batch_norm) {
+        constexpr float gamma = 0.48823851346969604;
+        constexpr float beta = 0.3687160313129425;
+        constexpr float mean = 0.5021218657493591;
+        constexpr float var = 0.03773479163646698;
+
+        log_power = (log_power.array() - mean) * gamma / sqrt(var + 0.001f) + beta;
+    }
+
+    return log_power;
+}
+
+
+// simd version
+// Time cost / frame : 3988 microseconds
+Matrixf CQ::computeCQT(const VectorXf& audio, bool batch_norm) {
     // NOTE : input audio should be 1D array at this point
     int hop = params.sample_per_frame;
     int n_fft_x = audio.size() / hop + 1;
@@ -129,8 +267,8 @@ Matrixf CQ::computeCQT(const Vectorf& audio, bool batch_norm) {
     cqt_feat = cqt_feat.array() * _lengths.transpose().array().replicate(1, n_fft_x);
 
     // power of magnitude
-    Matrixf power = cqt_feat.array().cwiseAbs2() + 1e-10;
-    Matrixf log_power = 10.0f * power.array().log10();
+    MatrixXf power = cqt_feat.array().cwiseAbs2() + 1e-10;
+    MatrixXf log_power = 10.0f * power.array().log10();
     log_power = (log_power.array() - log_power.minCoeff()) / (log_power.maxCoeff() - log_power.minCoeff());
 
     // batch normalization
@@ -149,13 +287,23 @@ Matrixf CQ::computeCQT(const Vectorf& audio, bool batch_norm) {
 // Matrixf CQ::cqtEigenHarmonic(const Vectorf& audio) {
 VecMatrixf CQ::cqtHarmonic(const Vectorf& audio, bool batch_norm) {
 
-    // Matrixf cqt_feat = cqtEigen(audio);
+
+    auto start1 = std::chrono::high_resolution_clock::now();
+
     Matrixf cqt_feat = computeCQT(audio, batch_norm);
+
+    auto end1 = std::chrono::high_resolution_clock::now();
+    auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1);
+
+    std::cout << "Time taken by computeCQT: " << duration1.count() << " milliseconds" << std::endl;
+    // Matrixf cqt_feat = cqtEigen(audio);
 
     std::vector<float> harmonics = {0.5};
     for ( int i = 1 ; i < N_HARMONICS ; i++ ) {
         harmonics.emplace_back(i);
     }
+
+    auto start2 = std::chrono::high_resolution_clock::now();
 
     VecMatrixf hs = harmonicStacking(
         cqt_feat,
@@ -163,6 +311,11 @@ VecMatrixf CQ::cqtHarmonic(const Vectorf& audio, bool batch_norm) {
         harmonics,
         N_BINS_CONTOUR
     );
+
+    auto end2 = std::chrono::high_resolution_clock::now();
+    auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2);
+
+    std::cout << "Time taken Stacking: " << duration2.count() << " milliseconds" << std::endl;
     return hs;
 }
 
