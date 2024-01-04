@@ -62,7 +62,7 @@ Matrixcf CQ::forward(const Vectorf &x, int hop_length) {
     Vectorf padded_x = reflectionPadding(x, params.fft_window_size / 2);
     Matrixcf cqt_feat = Matrixcf::Zero(n_fft_x, _kernel.rows());
 
-    int num_threads = 3; // Change this to the desired number of threads
+    int num_threads = 4; // Change this to the desired number of threads
     omp_set_num_threads(num_threads);
 
     #pragma omp parallel for shared(hop_length,n_fft_x,cqt_feat, padded_x) default(none) schedule(dynamic)
@@ -79,6 +79,7 @@ Matrixcf CQ::forward(const Vectorf &x, int hop_length) {
 
     return cqt_feat.transpose();
 }
+
 // normal forward
 // Matrixcf CQ::forward( const Vectorf &x, int hop_length ) {
 
@@ -97,36 +98,71 @@ Matrixcf CQ::forward(const Vectorf &x, int hop_length) {
 // }
 
 // output shape = (n_harmonics, n_frames, n_bins)
-// Time ave cost/ frame: 188 microseconds 
-VecMatrixf CQ::harmonicStacking(const Matrixf& cqt , int bins_per_semitone, std::vector<float> harmonics, int n_output_freqs) {
-    
-    int n_bins = cqt.rows(), n_frames = cqt.cols();
 
+//omp stacking
+VecMatrixf CQ::harmonicStacking(const Matrixf& cqt, int bins_per_semitone, std::vector<float> harmonics, int n_output_freqs) {
+    int n_bins = cqt.rows();
+    int n_frames = cqt.cols();
     VecMatrixf result(harmonics.size());
-    for ( size_t i = 0 ; i < harmonics.size() ; i++ ) {
-        
-        Matrixf padded = Matrixf::Zero(n_bins, n_frames);
+
+    int num_threads = 2; // Set the desired number of threads
+    omp_set_num_threads(num_threads);
+
+    #pragma omp parallel for shared(n_frames, n_bins, cqt, result, harmonics, bins_per_semitone, n_output_freqs) default(none) schedule(dynamic)
+    for (size_t i = 0; i < harmonics.size(); i++) {
         int shift = static_cast<int>(round(12.0f * bins_per_semitone * log2(harmonics[i])));
+        Matrixf padded = Matrixf::Zero(n_bins, n_frames);
 
         if (shift == 0)
             padded = cqt;
         else if (shift > 0) {
             padded.block(0, 0, n_bins - shift, n_frames) = cqt.block(shift, 0, n_bins - shift, n_frames);
-        }
-        else {
+        } else {
             padded.block(-shift, 0, n_bins + shift, n_frames) = cqt.block(0, 0, n_bins + shift, n_frames);
         }
 
         Matrixf temp = padded.block(0, 0, n_output_freqs, n_frames);
 
-        result[i] = temp.transpose();
+        #pragma omp critical
+        {
+            result[i] = temp.transpose();
+        }
     }
 
     return result;
 }
 
+
+// simple version
+// Time ave cost/ frame: 188 microseconds 
+// VecMatrixf CQ::harmonicStacking(const Matrixf& cqt , int bins_per_semitone, std::vector<float> harmonics, int n_output_freqs) {
+    
+//     int n_bins = cqt.rows(), n_frames = cqt.cols();
+
+//     VecMatrixf result(harmonics.size());
+//     for ( size_t i = 0 ; i < harmonics.size() ; i++ ) {
+        
+//         Matrixf padded = Matrixf::Zero(n_bins, n_frames);
+//         int shift = static_cast<int>(round(12.0f * bins_per_semitone * log2(harmonics[i])));
+
+//         if (shift == 0)
+//             padded = cqt;
+//         else if (shift > 0) {
+//             padded.block(0, 0, n_bins - shift, n_frames) = cqt.block(shift, 0, n_bins - shift, n_frames);
+//         }
+//         else {
+//             padded.block(-shift, 0, n_bins + shift, n_frames) = cqt.block(0, 0, n_bins + shift, n_frames);
+//         }
+
+//         Matrixf temp = padded.block(0, 0, n_output_freqs, n_frames);
+
+//         result[i] = temp.transpose();
+//     }
+
+//     return result;
+// }
+
 // Non-simd version
-// Time cost / frame : 4503 microseconds
 // Matrixf CQ::computeCQT(const VectorXf& audio, bool batch_norm) {
 //     // NOTE : input audio should be 1D array at this point
 //     int hop = params.sample_per_frame;
@@ -229,7 +265,6 @@ Matrixf CQ::computeCQT(const VectorXf& audio, bool batch_norm) {
 
 
 // simd version
-// Time cost / frame : 3988 microseconds
 // Matrixf CQ::computeCQT(const VectorXf& audio, bool batch_norm) {
 //     // NOTE : input audio should be 1D array at this point
 //     int hop = params.sample_per_frame;
@@ -288,9 +323,9 @@ VecMatrixf CQ::cqtHarmonic(const Vectorf& audio, bool batch_norm) {
     auto end1 = std::chrono::high_resolution_clock::now();
     auto duration1 = std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1);
 
-    std::cout << duration1.count()<< std::endl;
+    // std::cout << duration1.count()<< std::endl;
     // Matrixf cqt_feat = cqtEigen(audio);
-
+    
     std::vector<float> harmonics = {0.5};
     for ( int i = 1 ; i < N_HARMONICS ; i++ ) {
         harmonics.emplace_back(i);
@@ -308,7 +343,7 @@ VecMatrixf CQ::cqtHarmonic(const Vectorf& audio, bool batch_norm) {
     auto end2 = std::chrono::high_resolution_clock::now();
     auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2);
 
-    // std::cout << "Time taken Stacking: " << duration2.count() << " milliseconds" << std::endl;
+    // std::cout <<duration2.count() << std::endl;
     return hs;
 }
 

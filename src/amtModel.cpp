@@ -37,11 +37,24 @@ std::vector<Note> amtModel::transcribeAudio( const Vectorf& audio ) {
 }
 
 // input shape : (N_AUDIO_SAMPLES, N_BIN_CONTORU )
-void amtModel::inferenceFrame( const Vectorf& x ) {
+#include <chrono>
+
+void amtModel::inferenceFrame(const Vectorf& x) {
     VecMatrixf output;
+
+    // Start measuring time for cqtHarmonic
+    auto start = std::chrono::high_resolution_clock::now();
 
     // compute harmonic stacking, shape : (n_harmonics, n_frames, n_bins)
     VecMatrixf cqt = _cqt.cqtHarmonic(x, true);
+
+    // End measuring time for cqtHarmonic
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << duration.count() << std::endl;
+
+    // Start measuring time for other parts
+    start = std::chrono::high_resolution_clock::now();
 
     VecMatrixf contour_out = _contour_cnn.forward(cqt);
     _Yp_buffer.push_back(contour_out[0]); // Yp
@@ -56,6 +69,10 @@ void amtModel::inferenceFrame( const Vectorf& x ) {
     VecMatrixf concat_out = _onset_output_cnn.forward(concat_buf);
     _Yo_buffer.push_back(concat_out[0]); // Yo
 
+    // End measuring time for other parts
+    end = std::chrono::high_resolution_clock::now();
+    duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // std::cout << "Time used for other parts: " << duration.count() << " microseconds" << std::endl;
 }
 
 VecMatrixf amtModel::getOutput() {
